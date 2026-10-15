@@ -154,11 +154,11 @@ impl WindowsWindowInner {
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
-            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
+            WM_GPUI_CURSOR_STYLE_CHANGED
+            | WM_GPUI_FORCE_UPDATE_WINDOW
+            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(handle, msg, wparam, lparam),
             _ => None,
         };
         if let Some(n) = handled {
@@ -1251,7 +1251,28 @@ impl WindowsWindowInner {
         None
     }
 
+    fn handle_gpui_events(
+        &self,
+        handle: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if !is_from_gpui(wparam, self.validation_number) {
+            return None;
+        }
+        match message {
+            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            _ => None,
+        }
+    }
+
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+        if lparam.0 == 0 {
+            return None;
+        }
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
         if let Err(err) = self
@@ -1774,9 +1795,14 @@ fn notify_frame_changed(handle: HWND) {
     }
 }
 
+fn is_from_gpui(wparam: WPARAM, validation_number: usize) -> bool {
+    wparam.0 == validation_number
+}
+
 #[cfg(test)]
 mod tests {
-    use super::composition_target_range;
+    use super::{composition_target_range, is_from_gpui};
+    use windows::Win32::Foundation::WPARAM;
     use windows::Win32::UI::Input::Ime::{
         ATTR_CONVERTED, ATTR_INPUT, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED,
     };
@@ -1817,5 +1843,18 @@ mod tests {
     #[test]
     fn composition_target_is_none_without_attributes() {
         assert_eq!(composition_target_range(&[]), None);
+    }
+
+    #[test]
+    fn gpui_message_without_the_validation_token_is_rejected() {
+        let token = 0x5a5a_1234;
+        assert!(!is_from_gpui(WPARAM(0), token));
+        assert!(!is_from_gpui(WPARAM(token + 1), token));
+    }
+
+    #[test]
+    fn gpui_message_with_the_validation_token_is_accepted() {
+        let token = 0x5a5a_1234;
+        assert!(is_from_gpui(WPARAM(token), token));
     }
 }
