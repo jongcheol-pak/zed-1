@@ -335,6 +335,13 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
+                            // A hidden (SW_HIDE) window never gets its update region validated,
+                            // so invalidating it every vsync turns into a WM_PAINT storm that
+                            // keeps the UI thread busy. ShowWindow invalidates it again when it
+                            // comes back, so skipping it here loses no frame.
+                            if !IsWindowVisible(hwnd.as_raw()).as_bool() {
+                                continue;
+                            }
                             let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
                         }
                     }
