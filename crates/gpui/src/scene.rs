@@ -8,6 +8,7 @@ use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
+use smallvec::{SmallVec, smallvec};
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -50,6 +51,21 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    external_layers: Vec<ExternalLayer>,
+}
+
+/// A region the platform paints outside of gpui (for example a compositor visual stacked
+/// above the window's swap chain), placed in the paint order like a primitive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalLayer {
+    /// Caller-chosen id, unique within a frame.
+    pub id: u64,
+    /// Where the layer sits, before clipping.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip in effect when the layer was painted.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Whether something painted after the layer covers part of its clipped bounds.
+    pub occluded: bool,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +82,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.external_layers.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -93,6 +110,7 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return;
         }
+        self.occlude_external_layers(&primitive);
 
         let order = self
             .layer_stack
@@ -138,12 +156,64 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Records an external layer at the current point of the paint order. Returns false, and
+    /// records nothing, if a layer with the same id was already recorded in this frame.
+    pub fn insert_external_layer(
+        &mut self,
+        id: u64,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> bool {
+        if self.external_layers.iter().any(|layer| layer.id == id) {
+            return false;
+        }
+        let layer = ExternalLayer {
+            id,
+            bounds,
+            content_mask,
+            occluded: false,
+        };
+        self.external_layers.push(layer.clone());
+        self.paint_operations
+            .push(PaintOperation::ExternalLayer(layer));
+        true
+    }
+
+    /// Marks the external layers recorded so far that `primitive` paints over — it is painted
+    /// after them, so it covers them wherever it actually puts pixels.
+    fn occlude_external_layers(&mut self, primitive: &Primitive) {
+        if self.external_layers.iter().all(|layer| layer.occluded) {
+            return;
+        }
+        let mask = primitive.content_mask().bounds;
+        for area in painted_areas(primitive) {
+            let area = area.intersect(&mask);
+            if area.is_empty() {
+                continue;
+            }
+            for layer in &mut self.external_layers {
+                let visible = layer.bounds.intersect(&layer.content_mask.bounds);
+                if !layer.occluded && !visible.is_empty() && area.intersects(&visible) {
+                    layer.occluded = true;
+                }
+            }
+        }
+    }
+
+    /// The external layers recorded in this frame, in paint order.
+    pub fn external_layers(&self) -> &[ExternalLayer] {
+        &self.external_layers
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::ExternalLayer(layer) => {
+                    self.insert_external_layer(layer.id, layer.bounds, layer.content_mask);
+                }
             }
         }
     }
@@ -191,6 +261,36 @@ impl Scene {
     }
 }
 
+/// Where a primitive puts pixels, before its content mask. A quad with a transparent
+/// background paints only its border bands — a card's border is painted over the whole card
+/// after its children, and must not count as covering them.
+fn painted_areas(primitive: &Primitive) -> SmallVec<[Bounds<ScaledPixels>; 4]> {
+    match primitive {
+        Primitive::Quad(quad) if quad.background.is_transparent() => {
+            if quad.border_color.is_transparent() {
+                return SmallVec::new();
+            }
+            let Bounds { origin, size } = quad.bounds;
+            let widths = quad.border_widths;
+            let bands = [
+                Bounds::new(origin, crate::size(size.width, widths.top)),
+                Bounds::new(
+                    point(origin.x, origin.y + size.height - widths.bottom),
+                    crate::size(size.width, widths.bottom),
+                ),
+                Bounds::new(origin, crate::size(widths.left, size.height)),
+                Bounds::new(
+                    point(origin.x + size.width - widths.right, origin.y),
+                    crate::size(widths.right, size.height),
+                ),
+            ];
+            bands.into_iter().filter(|band| !band.is_empty()).collect()
+        }
+        Primitive::Shadow(shadow) => smallvec![shadow.bounds.dilate(shadow.blur_radius)],
+        _ => smallvec![*primitive.bounds()],
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[cfg_attr(
     all(
@@ -215,6 +315,7 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    ExternalLayer(ExternalLayer),
 }
 
 #[derive(Clone)]
@@ -911,5 +1012,136 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Edges, Hsla, size, solid_background};
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        }
+    }
+
+    fn unclipped() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: rect(0., 0., 1000., 1000.),
+        }
+    }
+
+    fn filled(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: unclipped(),
+            background: solid_background(Hsla::white()),
+            ..Default::default()
+        }
+    }
+
+    fn border_only(bounds: Bounds<ScaledPixels>, width: f32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: unclipped(),
+            border_color: Hsla::white(),
+            border_widths: Edges::all(ScaledPixels(width)),
+            ..Default::default()
+        }
+    }
+
+    fn occluded(scene: &Scene) -> Vec<bool> {
+        scene.external_layers().iter().map(|l| l.occluded).collect()
+    }
+
+    #[test]
+    fn a_later_overlapping_quad_occludes_the_layer() {
+        let mut scene = Scene::default();
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_primitive(filled(rect(0., 0., 100., 100.)));
+        scene.finish();
+        assert_eq!(occluded(&scene), vec![true]);
+    }
+
+    #[test]
+    fn a_later_disjoint_quad_does_not() {
+        let mut scene = Scene::default();
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_primitive(filled(rect(50., 50., 10., 10.)));
+        scene.finish();
+        assert_eq!(occluded(&scene), vec![false]);
+    }
+
+    #[test]
+    fn an_earlier_quad_under_the_layer_does_not() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(filled(rect(0., 0., 100., 100.)));
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.finish();
+        assert_eq!(occluded(&scene), vec![false]);
+    }
+
+    /// A row card's border is painted after its children over the whole row — only the
+    /// border bands are painted, so the spinner inside stays visible.
+    #[test]
+    fn a_later_border_only_quad_around_the_layer_does_not() {
+        let mut scene = Scene::default();
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_primitive(border_only(rect(0., 0., 100., 30.), 1.));
+        scene.finish();
+        assert_eq!(occluded(&scene), vec![false]);
+    }
+
+    #[test]
+    fn a_later_border_band_over_the_layer_occludes() {
+        let mut scene = Scene::default();
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_primitive(border_only(rect(12., 0., 100., 30.), 1.));
+        scene.finish();
+        assert_eq!(occluded(&scene), vec![true]);
+    }
+
+    #[test]
+    fn a_duplicate_layer_id_in_one_frame_is_refused() {
+        let mut scene = Scene::default();
+        assert!(scene.insert_external_layer(7, rect(10., 10., 8., 8.), unclipped()));
+        assert!(!scene.insert_external_layer(7, rect(40., 10., 8., 8.), unclipped()));
+        scene.finish();
+        assert_eq!(scene.external_layers().len(), 1);
+        assert_eq!(scene.external_layers()[0].bounds, rect(10., 10., 8., 8.));
+    }
+
+    #[test]
+    fn a_replayed_range_keeps_its_layer() {
+        let mut previous = Scene::default();
+        previous.insert_external_layer(3, rect(10., 10., 8., 8.), unclipped());
+        previous.insert_primitive(filled(rect(50., 50., 10., 10.)));
+        let end = previous.len();
+
+        let mut scene = Scene::default();
+        scene.replay(0..end, &previous);
+        scene.insert_primitive(filled(rect(12., 12., 2., 2.)));
+        scene.finish();
+        assert_eq!(scene.external_layers().len(), 1);
+        assert_eq!(scene.external_layers()[0].id, 3);
+        assert_eq!(occluded(&scene), vec![true]);
+    }
+
+    /// A half scrolled-out ring keeps its place and is cut by the clip, rather than being
+    /// squeezed into the visible part.
+    #[test]
+    fn the_frame_carries_unclipped_bounds_and_the_clip() {
+        let mut scene = Scene::default();
+        let clip = ContentMask {
+            bounds: rect(0., 14., 100., 100.),
+        };
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), clip);
+        scene.finish();
+        let layer = &scene.external_layers()[0];
+        assert_eq!(layer.bounds, rect(10., 10., 8., 8.));
+        assert_eq!(layer.content_mask, clip);
+        assert!(!layer.occluded);
     }
 }

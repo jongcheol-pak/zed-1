@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+mod composition_handles;
 mod destination_list;
 mod direct_manipulation;
 mod direct_write;
@@ -19,6 +20,7 @@ mod window;
 mod wrapper;
 
 pub(crate) use clipboard::*;
+pub(crate) use composition_handles::*;
 pub(crate) use destination_list::*;
 pub(crate) use direct_write::*;
 pub(crate) use directx_atlas::*;
@@ -35,6 +37,7 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
+pub use composition_handles::{CompositionHandles, composition_for_hwnd};
 pub use platform::WindowsPlatform;
 
 pub(crate) use windows::Win32::Foundation::HWND;

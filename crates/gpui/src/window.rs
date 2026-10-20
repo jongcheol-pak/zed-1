@@ -5,13 +5,13 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    EntityId, EventEmitter, ExternalLayer, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -1035,6 +1035,7 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    external_layer_observer: Option<Box<dyn FnMut(&[ExternalLayer]) -> bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1745,6 +1746,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            external_layer_observer: None,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -2830,6 +2832,11 @@ impl Window {
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
         profiler::record_frame_presented();
+        if let Some(observer) = self.external_layer_observer.as_mut()
+            && observer(self.rendered_frame.scene.external_layers())
+        {
+            self.refresh();
+        }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -3849,6 +3856,29 @@ impl Window {
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
         });
+    }
+
+    /// Records a region that the platform paints outside of gpui, at the current point of the
+    /// paint order. Returns false, and records nothing, if a layer with the same id was already
+    /// painted in this frame — the caller should then paint the content itself.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_external_layer(&mut self, id: u64, bounds: Bounds<Pixels>) -> bool {
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame
+            .scene
+            .insert_external_layer(id, bounds, content_mask)
+    }
+
+    /// Calls `observer` with the external layers of each presented frame, right after the
+    /// frame is handed to the platform. If `observer` returns true the window is refreshed.
+    pub fn set_external_layer_observer(
+        &mut self,
+        observer: impl FnMut(&[ExternalLayer]) -> bool + 'static,
+    ) {
+        self.external_layer_observer = Some(Box::new(observer));
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

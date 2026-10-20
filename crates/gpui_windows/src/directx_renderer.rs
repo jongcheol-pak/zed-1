@@ -101,6 +101,8 @@ struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
     comp_visual: IDCompositionVisual,
+    hwnd: HWND,
+    generation: u64,
 }
 
 impl DirectXRendererDevices {
@@ -154,8 +156,8 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
-                .context("Creating DirectComposition")?;
+            let composition =
+                DirectComposition::new(&devices, hwnd).context("Creating DirectComposition")?;
             composition
                 .set_swap_chain(&resources.swap_chain)
                 .context("Setting swap chain for DirectComposition")?;
@@ -278,8 +280,7 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition =
-                DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
+            let composition = DirectComposition::new(&devices, self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
@@ -896,15 +897,33 @@ impl DirectXRenderPipelines {
 }
 
 impl DirectComposition {
-    pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
+    pub fn new(devices: &DirectXRendererDevices, hwnd: HWND) -> Result<Self> {
+        let dxgi_device = devices
+            .dxgi_device
+            .as_ref()
+            .context("DirectComposition needs a DXGI device")?;
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
+
+        let mut generation = 0;
+        register_composition(hwnd.0 as isize, |next| {
+            generation = next;
+            CompositionHandles {
+                device: comp_device.clone(),
+                root: comp_visual.clone(),
+                d3d11_device: devices.device.clone(),
+                d3d11_context: devices.device_context.clone(),
+                generation: next,
+            }
+        });
 
         Ok(Self {
             comp_device,
             comp_target,
             comp_visual,
+            hwnd,
+            generation,
         })
     }
 
@@ -915,6 +934,12 @@ impl DirectComposition {
             self.comp_device.Commit()?;
         }
         Ok(())
+    }
+}
+
+impl Drop for DirectComposition {
+    fn drop(&mut self) {
+        forget_composition(self.hwnd.0 as isize, self.generation);
     }
 }
 
