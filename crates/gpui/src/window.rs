@@ -151,6 +151,7 @@ impl WindowInvalidator {
     }
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
+        profiler::record_view_invalidated(entity);
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
@@ -1888,8 +1889,10 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    #[track_caller]
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
+            profiler::record_window_refreshed(core::panic::Location::caller());
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
@@ -2826,6 +2829,7 @@ impl Window {
     #[profiling::function]
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
+        profiler::record_frame_presented();
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);

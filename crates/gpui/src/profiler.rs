@@ -820,3 +820,118 @@ impl FrameTimingCollector {
         unseen
     }
 }
+
+/// What made windows redraw between two [`take_dirty_sources`] calls.
+///
+/// Only counted while frame tracing is enabled via [`set_frame_trace_enabled`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DirtySources {
+    /// `Window::refresh` calls that marked a window dirty without naming a view.
+    pub refreshes: u64,
+    /// Where those `Window::refresh` calls came from (`file:line`), with their counts.
+    pub refresh_sites: Vec<(String, u64)>,
+    /// Frames handed to the platform renderer, including re-presents of an unchanged scene.
+    pub presents: u64,
+    /// Notified views (before propagation to ancestors) by type name, with their counts.
+    pub views: Vec<(&'static str, u64)>,
+}
+
+#[derive(Default)]
+struct DirtySourceCounts {
+    refreshes: u64,
+    refresh_sites: Option<HashMap<&'static core::panic::Location<'static>, u64>>,
+    presents: u64,
+    views: Option<HashMap<crate::EntityId, u64>>,
+    type_names: Option<HashMap<crate::EntityId, &'static str>>,
+}
+
+static DIRTY_SOURCES: spin::Mutex<DirtySourceCounts> = spin::Mutex::new(DirtySourceCounts {
+    refreshes: 0,
+    refresh_sites: None,
+    presents: 0,
+    views: None,
+    type_names: None,
+});
+
+pub(crate) fn record_entity_type(entity_id: crate::EntityId, type_name: &'static str) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+    DIRTY_SOURCES
+        .lock()
+        .type_names
+        .get_or_insert_with(HashMap::default)
+        .insert(entity_id, type_name);
+}
+
+pub(crate) fn record_view_invalidated(entity_id: crate::EntityId) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+    *DIRTY_SOURCES
+        .lock()
+        .views
+        .get_or_insert_with(HashMap::default)
+        .entry(entity_id)
+        .or_default() += 1;
+}
+
+pub(crate) fn record_window_refreshed(site: &'static core::panic::Location<'static>) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+    let mut counts = DIRTY_SOURCES.lock();
+    counts.refreshes += 1;
+    *counts
+        .refresh_sites
+        .get_or_insert_with(HashMap::default)
+        .entry(site)
+        .or_default() += 1;
+}
+
+pub(crate) fn record_frame_presented() {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+    DIRTY_SOURCES.lock().presents += 1;
+}
+
+/// Returns the dirty sources counted since the previous call and resets the counts.
+///
+/// Views are grouped by the type name recorded when the entity was created; entities
+/// created before frame tracing was enabled are reported as `"<unknown>"`.
+pub fn take_dirty_sources() -> DirtySources {
+    let mut counts = DIRTY_SOURCES.lock();
+    let refreshes = std::mem::take(&mut counts.refreshes);
+    let mut refresh_sites: Vec<_> = counts
+        .refresh_sites
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(site, count)| (format!("{}:{}", site.file(), site.line()), count))
+        .collect();
+    refresh_sites.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let presents = std::mem::take(&mut counts.presents);
+    let views = counts.views.take().unwrap_or_default();
+    let mut by_type: HashMap<&'static str, u64> = HashMap::default();
+    for (entity_id, count) in views {
+        let type_name = counts
+            .type_names
+            .as_ref()
+            .and_then(|names| names.get(&entity_id).copied())
+            .unwrap_or("<unknown>");
+        *by_type.entry(type_name).or_default() += count;
+    }
+    let mut views: Vec<_> = by_type.into_iter().collect();
+    views.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    DirtySources {
+        refreshes,
+        refresh_sites,
+        presents,
+        views,
+    }
+}

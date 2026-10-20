@@ -123,6 +123,7 @@ impl EntityMap {
     {
         let mut accessed_entities = self.accessed_entities.get_mut();
         accessed_entities.insert(slot.entity_id);
+        crate::profiler::record_entity_type(slot.entity_id, type_name::<T>());
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
