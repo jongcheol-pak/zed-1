@@ -66,6 +66,9 @@ pub struct ExternalLayer {
     pub content_mask: ContentMask<ScaledPixels>,
     /// Whether something painted after the layer covers part of its clipped bounds.
     pub occluded: bool,
+    /// The element opacity in effect when the layer was painted — the platform applies it,
+    /// since the layer is not drawn by the scene.
+    pub opacity: f32,
 }
 
 #[expect(missing_docs)]
@@ -163,6 +166,7 @@ impl Scene {
         id: u64,
         bounds: Bounds<ScaledPixels>,
         content_mask: ContentMask<ScaledPixels>,
+        opacity: f32,
     ) -> bool {
         if self.external_layers.iter().any(|layer| layer.id == id) {
             return false;
@@ -172,6 +176,7 @@ impl Scene {
             bounds,
             content_mask,
             occluded: false,
+            opacity,
         };
         self.external_layers.push(layer.clone());
         self.paint_operations
@@ -212,7 +217,12 @@ impl Scene {
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::ExternalLayer(layer) => {
-                    self.insert_external_layer(layer.id, layer.bounds, layer.content_mask);
+                    self.insert_external_layer(
+                        layer.id,
+                        layer.bounds,
+                        layer.content_mask,
+                        layer.opacity,
+                    );
                 }
             }
         }
@@ -1059,7 +1069,7 @@ mod tests {
     #[test]
     fn a_later_overlapping_quad_occludes_the_layer() {
         let mut scene = Scene::default();
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped(), 1.);
         scene.insert_primitive(filled(rect(0., 0., 100., 100.)));
         scene.finish();
         assert_eq!(occluded(&scene), vec![true]);
@@ -1068,7 +1078,7 @@ mod tests {
     #[test]
     fn a_later_disjoint_quad_does_not() {
         let mut scene = Scene::default();
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped(), 1.);
         scene.insert_primitive(filled(rect(50., 50., 10., 10.)));
         scene.finish();
         assert_eq!(occluded(&scene), vec![false]);
@@ -1078,7 +1088,7 @@ mod tests {
     fn an_earlier_quad_under_the_layer_does_not() {
         let mut scene = Scene::default();
         scene.insert_primitive(filled(rect(0., 0., 100., 100.)));
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped(), 1.);
         scene.finish();
         assert_eq!(occluded(&scene), vec![false]);
     }
@@ -1088,7 +1098,7 @@ mod tests {
     #[test]
     fn a_later_border_only_quad_around_the_layer_does_not() {
         let mut scene = Scene::default();
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped(), 1.);
         scene.insert_primitive(border_only(rect(0., 0., 100., 30.), 1.));
         scene.finish();
         assert_eq!(occluded(&scene), vec![false]);
@@ -1097,7 +1107,7 @@ mod tests {
     #[test]
     fn a_later_border_band_over_the_layer_occludes() {
         let mut scene = Scene::default();
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped());
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), unclipped(), 1.);
         scene.insert_primitive(border_only(rect(12., 0., 100., 30.), 1.));
         scene.finish();
         assert_eq!(occluded(&scene), vec![true]);
@@ -1106,8 +1116,8 @@ mod tests {
     #[test]
     fn a_duplicate_layer_id_in_one_frame_is_refused() {
         let mut scene = Scene::default();
-        assert!(scene.insert_external_layer(7, rect(10., 10., 8., 8.), unclipped()));
-        assert!(!scene.insert_external_layer(7, rect(40., 10., 8., 8.), unclipped()));
+        assert!(scene.insert_external_layer(7, rect(10., 10., 8., 8.), unclipped(), 1.));
+        assert!(!scene.insert_external_layer(7, rect(40., 10., 8., 8.), unclipped(), 1.));
         scene.finish();
         assert_eq!(scene.external_layers().len(), 1);
         assert_eq!(scene.external_layers()[0].bounds, rect(10., 10., 8., 8.));
@@ -1116,7 +1126,7 @@ mod tests {
     #[test]
     fn a_replayed_range_keeps_its_layer() {
         let mut previous = Scene::default();
-        previous.insert_external_layer(3, rect(10., 10., 8., 8.), unclipped());
+        previous.insert_external_layer(3, rect(10., 10., 8., 8.), unclipped(), 1.);
         previous.insert_primitive(filled(rect(50., 50., 10., 10.)));
         let end = previous.len();
 
@@ -1137,11 +1147,26 @@ mod tests {
         let clip = ContentMask {
             bounds: rect(0., 14., 100., 100.),
         };
-        scene.insert_external_layer(1, rect(10., 10., 8., 8.), clip);
+        scene.insert_external_layer(1, rect(10., 10., 8., 8.), clip, 1.);
         scene.finish();
         let layer = &scene.external_layers()[0];
         assert_eq!(layer.bounds, rect(10., 10., 8., 8.));
         assert_eq!(layer.content_mask, clip);
         assert!(!layer.occluded);
+    }
+
+    /// A spinner inside a half-transparent button is drawn by the platform, so the layer
+    /// has to carry the opacity it was painted with — including when its range is replayed.
+    #[test]
+    fn an_external_layer_keeps_the_opacity_it_was_painted_with() {
+        let mut previous = Scene::default();
+        previous.insert_external_layer(5, rect(10., 10., 8., 8.), unclipped(), 0.4);
+        let end = previous.len();
+        assert_eq!(previous.external_layers()[0].opacity, 0.4);
+
+        let mut scene = Scene::default();
+        scene.replay(0..end, &previous);
+        scene.finish();
+        assert_eq!(scene.external_layers()[0].opacity, 0.4);
     }
 }

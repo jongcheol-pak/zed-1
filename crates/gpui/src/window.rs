@@ -3867,9 +3867,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame
             .scene
-            .insert_external_layer(id, bounds, content_mask)
+            .insert_external_layer(id, bounds, content_mask, opacity)
     }
 
     /// Calls `observer` with the external layers of each presented frame, right after the
@@ -6528,6 +6529,32 @@ mod tests {
                 .child(div().w(px(50.)).h(px(50.)).track_focus(&self.a))
                 .child(div().w(px(50.)).h(px(50.)).track_focus(&self.b))
         }
+    }
+
+    /// A layer painted inside a half-transparent element carries that opacity, since the
+    /// platform — not the scene — draws it.
+    #[gpui::test]
+    fn an_external_layer_records_the_element_opacity(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let recorded = Rc::new(Cell::new(None));
+        cx.draw(crate::point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let recorded = recorded.clone();
+            move |_, _| {
+                div().opacity(0.4).child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            window.paint_external_layer(9, bounds);
+                            let layers = window.next_frame.scene.external_layers();
+                            recorded.set(layers.last().map(|layer| layer.opacity));
+                        },
+                    )
+                    .size(px(8.)),
+                )
+            }
+        });
+        let opacity = recorded.get();
+        assert_eq!(opacity, Some(0.4));
     }
 
     /// When a focus listener moves focus again (e.g. a dock forwarding focus to its
