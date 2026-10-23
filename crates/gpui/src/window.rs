@@ -3449,17 +3449,23 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        let (task, is_first) = cx.fetch_asset::<A>(source);
+        let (task, _) = cx.fetch_asset::<A>(source);
         task.clone().now_or_never().or_else(|| {
-            if is_first {
-                let entity_id = self.current_view();
+            // Every view that asks while the load is pending is notified when it finishes — not
+            // only the one whose request started it. Each view waits once per asset.
+            let waiter = (
+                (TypeId::of::<A>(), crate::hash(source)),
+                self.current_view(),
+            );
+            if cx.asset_waiters.insert(waiter) {
                 self.spawn(cx, {
                     let task = task.clone();
                     async move |cx| {
                         task.await;
 
                         cx.on_next_frame(move |_, cx| {
-                            cx.notify(entity_id);
+                            cx.asset_waiters.remove(&waiter);
+                            cx.notify(waiter.1);
                         });
                     }
                 })
@@ -6600,5 +6606,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct SharedTestAsset;
+
+    impl crate::Asset for SharedTestAsset {
+        type Source = u32;
+        type Output = u32;
+
+        fn load(
+            source: Self::Source,
+            _: &mut crate::App,
+        ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+            async move { source }
+        }
+    }
+
+    struct AssetUser {
+        renders: Rc<Cell<usize>>,
+        loaded: Rc<Cell<Option<u32>>>,
+    }
+
+    impl Render for AssetUser {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            self.loaded.set(window.use_asset::<SharedTestAsset>(&7, cx));
+            div()
+        }
+    }
+
+    struct TwoAssetUsers {
+        a: crate::Entity<AssetUser>,
+        b: crate::Entity<AssetUser>,
+    }
+
+    impl Render for TwoAssetUsers {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Cached like real panes, so a notify on one view does not re-render the other.
+            div()
+                .child(
+                    crate::AnyView::from(self.a.clone()).cached(crate::StyleRefinement::default()),
+                )
+                .child(
+                    crate::AnyView::from(self.b.clone()).cached(crate::StyleRefinement::default()),
+                )
+        }
+    }
+
+    /// Every view that asked for an asset while it was loading must be notified when the
+    /// load finishes — not only the view whose request started the load.
+    #[gpui::test]
+    fn use_asset_notifies_every_waiting_view(cx: &mut TestAppContext) {
+        let b_loaded = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let b_loaded = b_loaded.clone();
+            move |_, cx| {
+                let a = cx.new(|_| AssetUser {
+                    renders: Rc::default(),
+                    loaded: Rc::default(),
+                });
+                let b = cx.new(|_| AssetUser {
+                    renders: Rc::default(),
+                    loaded: b_loaded,
+                });
+                TwoAssetUsers { a, b }
+            }
+        });
+        // First frame: both views ask while the load is pending. Then let the load finish,
+        // deliver the next frame and let the notified views redraw — no forced refresh.
+        cx.executor().run_until_parked();
+        window
+            .update(cx, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap();
+        cx.executor().run_until_parked();
+        assert_eq!(b_loaded.get(), Some(7));
     }
 }

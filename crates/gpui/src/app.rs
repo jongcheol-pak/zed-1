@@ -723,6 +723,8 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    /// Views waiting in `Window::use_asset` for a pending asset, keyed by asset.
+    pub(crate) asset_waiters: FxHashSet<((TypeId, u64), EntityId)>,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
@@ -801,6 +803,7 @@ impl App {
                 foreground_executor,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
                 loading_assets: Default::default(),
+                asset_waiters: Default::default(),
                 asset_source,
                 http_client,
                 globals_by_type: Default::default(),
