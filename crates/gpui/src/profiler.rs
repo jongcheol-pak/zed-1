@@ -741,6 +741,24 @@ static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings 
 
 static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The slowest draw per window since the last [`take_slowest_draws`], kept even when frame
+/// tracing is off. One entry per window, so it stays small without a cap.
+static SLOWEST_DRAWS: spin::Mutex<Vec<(WindowId, Duration)>> = spin::Mutex::new(Vec::new());
+
+/// Records how long a window draw took, keeping only the slowest per window.
+pub(crate) fn record_draw_duration(window_id: WindowId, duration: Duration) {
+    let mut slowest = SLOWEST_DRAWS.lock();
+    match slowest.iter_mut().find(|(id, _)| *id == window_id) {
+        Some((_, max)) => *max = (*max).max(duration),
+        None => slowest.push((window_id, duration)),
+    }
+}
+
+/// Drains the slowest draw per window recorded since the previous call.
+pub fn take_slowest_draws() -> Vec<(WindowId, Duration)> {
+    std::mem::take(&mut *SLOWEST_DRAWS.lock())
+}
+
 /// Enables or disables frame timing collection at runtime.
 ///
 /// When transitioning from enabled to disabled, the buffered frame timings are
@@ -933,5 +951,24 @@ pub fn take_dirty_sources() -> DirtySources {
         refresh_sites,
         presents,
         views,
+    }
+}
+
+#[cfg(test)]
+mod slowest_draw_tests {
+    use super::*;
+
+    /// The slowest draw per window is kept while frame tracing is off, and taking it drains it.
+    #[test]
+    fn slow_frame_max_is_kept_without_trace() {
+        assert!(!frame_trace_enabled());
+        let window = WindowId::from(4242u64);
+        record_draw_duration(window, Duration::from_millis(20));
+        record_draw_duration(window, Duration::from_millis(120));
+        record_draw_duration(window, Duration::from_millis(30));
+        let taken = take_slowest_draws();
+        let ours: Vec<_> = taken.iter().filter(|(id, _)| *id == window).collect();
+        assert_eq!(ours, vec![&(window, Duration::from_millis(120))]);
+        assert!(take_slowest_draws().iter().all(|(id, _)| *id != window));
     }
 }

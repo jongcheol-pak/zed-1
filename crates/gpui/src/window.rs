@@ -2688,7 +2688,8 @@ impl Window {
         // Drain unconditionally so a stale first-invalidation timestamp can't
         // leak into a later frame across enable/disable of frame tracing.
         let frame_dirty = self.invalidator.take_frame_dirty();
-        let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
+        let draw_began = Instant::now();
+        let draw_started_at = profiler::frame_trace_enabled().then_some(draw_began);
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -2796,13 +2797,15 @@ impl Window {
         }
         self.needs_present.set(true);
 
+        let draw_end = Instant::now();
+        profiler::record_draw_duration(self.handle.window_id(), draw_end - draw_began);
         if let Some(draw_start) = draw_started_at {
             profiler::record_frame_timing(profiler::FrameTiming {
                 window_id: self.handle.window_id(),
                 dirty_at: frame_dirty.dirty_at,
                 invalidations: frame_dirty.invalidations,
                 draw_start,
-                draw_end: Instant::now(),
+                draw_end,
             });
         }
 
