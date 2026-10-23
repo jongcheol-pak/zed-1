@@ -599,6 +599,14 @@ impl DispatchTree {
         &self.nodes[node_id.0]
     }
 
+    /// The innermost view that contains the given node.
+    pub fn nearest_view(&self, node_id: DispatchNodeId) -> Option<EntityId> {
+        std::iter::successors(Some(self.node(node_id)), |node| {
+            Some(self.node(node.parent?))
+        })
+        .find_map(|node| node.view_id)
+    }
+
     fn active_node(&mut self) -> &mut DispatchNode {
         let active_node_id = self.active_node_id().unwrap();
         &mut self.nodes[active_node_id.0]

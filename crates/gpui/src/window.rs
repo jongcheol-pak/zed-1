@@ -686,6 +686,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The view that inserted this hitbox. Its hover styles depend on the input modality, so it
+    /// is the view to notify when the modality changes.
+    pub(crate) view: Option<EntityId>,
 }
 
 impl Hitbox {
@@ -4387,6 +4390,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            view: self.rendered_entity_stack.last().copied(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -4652,6 +4656,35 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Redraw only what the input modality changes: hover styles of the hitboxes under the mouse
+    /// and the focus-visible style of the focused element. Refreshing the whole window here made
+    /// every click after typing (and every key after clicking) redraw every cached view.
+    fn notify_modality_readers(&mut self, cx: &mut App) {
+        let mut views: SmallVec<[EntityId; 8]> = SmallVec::new();
+        let position = self.mouse_position;
+        for hitbox in self.rendered_frame.hitboxes.iter() {
+            if hitbox
+                .bounds
+                .intersect(&hitbox.content_mask.bounds)
+                .contains(&position)
+                && let Some(view) = hitbox.view
+                && !views.contains(&view)
+            {
+                views.push(view);
+            }
+        }
+        if let Some(focus) = self.focus
+            && let Some(node) = self.rendered_frame.dispatch_tree.focusable_node_id(focus)
+            && let Some(view) = self.rendered_frame.dispatch_tree.nearest_view(node)
+            && !views.contains(&view)
+        {
+            views.push(view);
+        }
+        for view in views {
+            cx.notify(view);
+        }
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -4669,7 +4702,7 @@ impl Window {
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
-            self.refresh();
+            self.notify_modality_readers(cx);
         }
 
         // Handlers may set this to false by calling `stop_propagation`.
@@ -6453,8 +6486,8 @@ pub fn outline(
 mod tests {
     use crate::{
         AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, Styled as _, TestAppContext, Window, canvas, div, px,
-        size,
+        ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _,
+        TestAppContext, Window, canvas, div, px, size,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -6680,5 +6713,105 @@ mod tests {
             .unwrap();
         cx.executor().run_until_parked();
         assert_eq!(b_loaded.get(), Some(7));
+    }
+
+    struct Pressable {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Pressable {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .id("pressable")
+                .size(px(50.))
+                .hover(|style| style.opacity(0.5))
+                .active(|style| style.opacity(0.2))
+                .on_click(|_, _, _| {})
+        }
+    }
+
+    struct Bystander {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Bystander {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size(px(50.))
+        }
+    }
+
+    struct PressHost {
+        pressable: crate::Entity<Pressable>,
+        bystander: crate::Entity<Bystander>,
+    }
+
+    impl Render for PressHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.pressable.clone())
+                        .cached(crate::StyleRefinement::default()),
+                )
+                .child(
+                    crate::AnyView::from(self.bystander.clone())
+                        .cached(crate::StyleRefinement::default()),
+                )
+        }
+    }
+
+    fn press_host(
+        cx: &mut TestAppContext,
+    ) -> (
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+        &mut crate::VisualTestContext,
+    ) {
+        let pressed = Rc::new(Cell::new(0));
+        let watched = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let pressed = pressed.clone();
+            let watched = watched.clone();
+            move |_, cx| PressHost {
+                pressable: cx.new(|_| Pressable { renders: pressed }),
+                bystander: cx.new(|_| Bystander { renders: watched }),
+            }
+        });
+        cx.run_until_parked();
+        (pressed, watched, cx)
+    }
+
+    /// Pressing an element changes how its own view paints; it must not redraw every other
+    /// cached view in the window.
+    #[gpui::test]
+    fn click_does_not_refresh_window(cx: &mut TestAppContext) {
+        let (_, watched, cx) = press_host(cx);
+        let before = watched.get();
+        cx.simulate_click(crate::point(px(10.), px(10.)), crate::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(watched.get(), before);
+    }
+
+    /// Switching between mouse and keyboard input changes hover styles; only the views whose
+    /// hitboxes are under the mouse need to redraw — including a cached one.
+    #[gpui::test]
+    fn modality_change_notifies_only_readers(cx: &mut TestAppContext) {
+        let (pressed, watched, cx) = press_host(cx);
+        cx.simulate_mouse_move(
+            crate::point(px(10.), px(10.)),
+            None,
+            crate::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        let (pressed_before, watched_before) = (pressed.get(), watched.get());
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        assert_eq!(watched.get(), watched_before, "bystander redrew");
+        assert!(
+            pressed.get() > pressed_before,
+            "hovered view did not redraw"
+        );
     }
 }
