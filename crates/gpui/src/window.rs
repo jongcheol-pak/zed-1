@@ -2836,7 +2836,9 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        let present_began = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        profiler::record_present_duration(self.handle.window_id(), present_began.elapsed());
         profiler::record_frame_presented();
         if let Some(observer) = self.external_layer_observer.as_mut()
             && observer(self.rendered_frame.scene.external_layers())

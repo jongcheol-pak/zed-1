@@ -759,6 +759,47 @@ pub fn take_slowest_draws() -> Vec<(WindowId, Duration)> {
     std::mem::take(&mut *SLOWEST_DRAWS.lock())
 }
 
+/// How long handing frames to the platform (the swap-chain present) took for one window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentStats {
+    /// Frames presented.
+    pub count: u32,
+    /// Summed present time.
+    pub total: Duration,
+    /// Longest single present.
+    pub max: Duration,
+    /// Presents that took longer than two 60 Hz frames (33 ms).
+    pub over_33ms: u32,
+}
+
+/// Present cost per window since the last [`take_present_stats`], kept even when frame tracing
+/// is off. One entry per window.
+static PRESENT_STATS: spin::Mutex<Vec<(WindowId, PresentStats)>> = spin::Mutex::new(Vec::new());
+
+/// Records how long one present took for a window.
+pub(crate) fn record_present_duration(window_id: WindowId, duration: Duration) {
+    let mut all = PRESENT_STATS.lock();
+    let index = match all.iter().position(|(id, _)| *id == window_id) {
+        Some(index) => index,
+        None => {
+            all.push((window_id, PresentStats::default()));
+            all.len() - 1
+        }
+    };
+    let stats = &mut all[index].1;
+    stats.count += 1;
+    stats.total += duration;
+    stats.max = stats.max.max(duration);
+    if duration > Duration::from_millis(33) {
+        stats.over_33ms += 1;
+    }
+}
+
+/// Drains the present cost per window recorded since the previous call.
+pub fn take_present_stats() -> Vec<(WindowId, PresentStats)> {
+    std::mem::take(&mut *PRESENT_STATS.lock())
+}
+
 /// Enables or disables frame timing collection at runtime.
 ///
 /// When transitioning from enabled to disabled, the buffered frame timings are
@@ -970,5 +1011,36 @@ mod slowest_draw_tests {
         let ours: Vec<_> = taken.iter().filter(|(id, _)| *id == window).collect();
         assert_eq!(ours, vec![&(window, Duration::from_millis(120))]);
         assert!(take_slowest_draws().iter().all(|(id, _)| *id != window));
+    }
+}
+
+#[cfg(test)]
+mod present_stats_tests {
+    use super::*;
+
+    /// Present cost is summed per window (count, total, max, presents over 33 ms) without tracing,
+    /// and taking it drains it. One test: the store is global, so a second test taking in
+    /// parallel would steal this one's entries.
+    #[test]
+    fn present_stats_are_kept_per_window_and_drained() {
+        let window = WindowId::from(5151u64);
+        let other = WindowId::from(5152u64);
+        record_present_duration(window, Duration::from_millis(10));
+        record_present_duration(window, Duration::from_millis(40));
+        record_present_duration(other, Duration::from_millis(33));
+        let taken = take_present_stats();
+        let ours = taken.iter().find(|(id, _)| *id == window).map(|(_, s)| *s);
+        assert_eq!(
+            ours,
+            Some(PresentStats {
+                count: 2,
+                total: Duration::from_millis(50),
+                max: Duration::from_millis(40),
+                over_33ms: 1,
+            })
+        );
+        let theirs = taken.iter().find(|(id, _)| *id == other).map(|(_, s)| *s);
+        assert_eq!(theirs.map(|s| s.over_33ms), Some(0), "33 ms itself is not over");
+        assert!(take_present_stats().iter().all(|(id, _)| *id != window));
     }
 }
