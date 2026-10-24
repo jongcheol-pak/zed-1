@@ -863,6 +863,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -3239,6 +3240,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -3249,6 +3251,12 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
@@ -6818,5 +6826,79 @@ mod tests {
             pressed.get() > pressed_before,
             "hovered view did not redraw"
         );
+    }
+
+    struct DragStrip;
+
+    impl Render for DragStrip {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(100.))
+                .h(px(20.))
+                .window_control_area(crate::WindowControlArea::Drag)
+        }
+    }
+
+    struct ControlHost {
+        strip: crate::Entity<DragStrip>,
+    }
+
+    impl Render for ControlHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .w(px(10.))
+                        .h(px(10.))
+                        .window_control_area(crate::WindowControlArea::Close),
+                )
+                .child(
+                    crate::AnyView::from(self.strip.clone())
+                        .cached(crate::StyleRefinement::default().w(px(100.)).h(px(20.))),
+                )
+        }
+    }
+
+    /// A cached view replayed from the previous frame keeps its window control areas — without
+    /// them the platform answers a hit test over a cached title bar as client area, so the window
+    /// cannot be dragged until the title bar happens to repaint.
+    #[test]
+    fn cached_view_keeps_window_control_areas() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, cx| ControlHost {
+            strip: cx.new(|_| DragStrip),
+        });
+        let strip = window
+            .update(&mut cx, |host, _, _| host.strip.clone())
+            .unwrap();
+        let areas = |window: &Window| {
+            window
+                .rendered_frame
+                .window_control_hitboxes
+                .iter()
+                .map(|(area, _)| *area)
+                .collect::<Vec<_>>()
+        };
+        let painted = cx
+            .update_window(window.into(), |_, window, cx| {
+                strip.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear();
+                areas(window)
+            })
+            .unwrap();
+        let replayed = cx
+            .update_window(window.into(), |_, window, cx| {
+                window
+                    .root::<ControlHost>()
+                    .flatten()
+                    .unwrap()
+                    .update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear();
+                areas(window)
+            })
+            .unwrap();
+        assert!(painted.contains(&crate::WindowControlArea::Drag));
+        assert_eq!(replayed, painted);
     }
 }
