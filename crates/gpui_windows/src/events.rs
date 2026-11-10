@@ -677,21 +677,27 @@ impl WindowsWindowInner {
             }
             if lparam & GCS_COMPSTR.0 > 0 {
                 let comp_string = parse_ime_composition_string(ctx, GCS_COMPSTR)?;
-                let caret_pos =
+                let attrs = if comp_string.is_empty() {
+                    Vec::new()
+                } else {
+                    retrieve_composition_attributes(ctx)
+                };
+                let selected_range = composition_target_range(&attrs).or_else(|| {
                     (!comp_string.is_empty() && lparam & GCS_CURSORPOS.0 > 0).then(|| {
                         let cursor_pos = retrieve_composition_cursor_position(ctx);
-                        let pos = if should_use_ime_cursor_position(ctx, cursor_pos) {
+                        let pos = if should_use_ime_cursor_position(&attrs, cursor_pos) {
                             cursor_pos
                         } else {
                             comp_string.len()
                         };
                         pos..pos
-                    });
+                    })
+                });
                 self.with_input_handler(|input_handler| {
                     input_handler.replace_and_mark_text_in_range(
                         None,
                         &String::from_utf16_lossy(&comp_string),
-                        caret_pos,
+                        selected_range,
                     );
                 })?;
             }
@@ -1599,13 +1605,24 @@ fn retrieve_composition_cursor_position(ctx: HIMC) -> usize {
     unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) as usize }
 }
 
-fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
-    let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) } as usize;
-    if attrs_size == 0 {
-        return false;
+fn composition_target_range(attrs: &[u8]) -> Option<std::ops::Range<usize>> {
+    let is_target =
+        |attr: &u8| *attr == ATTR_TARGET_CONVERTED as u8 || *attr == ATTR_TARGET_NOTCONVERTED as u8;
+    let start = attrs.iter().position(is_target)?;
+    let len = attrs[start..]
+        .iter()
+        .take_while(|attr| is_target(attr))
+        .count();
+    Some(start..start + len)
+}
+
+fn retrieve_composition_attributes(ctx: HIMC) -> Vec<u8> {
+    let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) };
+    if attrs_size <= 0 {
+        return Vec::new();
     }
 
-    let mut attrs = vec![0u8; attrs_size];
+    let mut attrs = vec![0u8; attrs_size as usize];
     let result = unsafe {
         ImmGetCompositionStringW(
             ctx,
@@ -1615,6 +1632,14 @@ fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
         )
     };
     if result <= 0 {
+        return Vec::new();
+    }
+    attrs.truncate(result as usize);
+    attrs
+}
+
+fn should_use_ime_cursor_position(attrs: &[u8], cursor_pos: usize) -> bool {
+    if attrs.is_empty() {
         return false;
     }
 
@@ -1686,5 +1711,51 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::composition_target_range;
+    use windows::Win32::UI::Input::Ime::{
+        ATTR_CONVERTED, ATTR_INPUT, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED,
+    };
+
+    const INPUT: u8 = ATTR_INPUT as u8;
+    const TARGET_CONVERTED: u8 = ATTR_TARGET_CONVERTED as u8;
+    const CONVERTED: u8 = ATTR_CONVERTED as u8;
+    const TARGET_NOT_CONVERTED: u8 = ATTR_TARGET_NOTCONVERTED as u8;
+
+    #[test]
+    fn composition_target_is_the_converted_target_clause() {
+        let attrs = [
+            CONVERTED,
+            CONVERTED,
+            TARGET_CONVERTED,
+            TARGET_CONVERTED,
+            CONVERTED,
+        ];
+        assert_eq!(composition_target_range(&attrs), Some(2..4));
+    }
+
+    #[test]
+    fn composition_target_is_the_first_contiguous_target_run() {
+        let attrs = [
+            TARGET_NOT_CONVERTED,
+            TARGET_NOT_CONVERTED,
+            CONVERTED,
+            TARGET_CONVERTED,
+        ];
+        assert_eq!(composition_target_range(&attrs), Some(0..2));
+    }
+
+    #[test]
+    fn composition_target_is_none_while_only_input() {
+        assert_eq!(composition_target_range(&[INPUT, INPUT, INPUT]), None);
+    }
+
+    #[test]
+    fn composition_target_is_none_without_attributes() {
+        assert_eq!(composition_target_range(&[]), None);
     }
 }
