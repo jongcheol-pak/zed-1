@@ -552,8 +552,13 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        let placement =
-            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
+        let placement = retrieve_window_placement(
+            hwnd,
+            display,
+            params.bounds,
+            this.state.scale_factor.get(),
+            &this.state.border_offset,
+        )?;
         if params.show {
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
@@ -1511,6 +1516,7 @@ fn retrieve_window_placement(
     hwnd: HWND,
     display: WindowsDisplay,
     initial_bounds: Bounds<Pixels>,
+    window_scale_factor: f32,
     border_offset: &WindowBorderOffset,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
@@ -1524,14 +1530,15 @@ fn retrieve_window_placement(
     } else {
         display.default_bounds()
     };
-    // `bounds` is expressed in logical pixels for `display`, so it must be converted
-    // to device pixels using that display's own scale factor. The window's current
-    // scale factor can't be used here: `CreateWindowExW` was called with
-    // `CW_USEDEFAULT`, so at this point the window may still be sitting on whichever
-    // monitor Windows picked by default, which can have a different DPI than `display`
-    // and would otherwise throw off the physical position (e.g. leaving the window
-    // partially off-screen when moved to a monitor with a different scale factor).
-    let bounds = bounds.to_device_pixels(display.scale_factor());
+    // The origin is in `display`'s logical pixels, so it converts with that display's
+    // scale factor. The size converts with the window's current scale factor: the
+    // window was created with `CW_USEDEFAULT` and may still sit on another monitor,
+    // and moving it onto `display` sends `WM_DPICHANGED`, whose suggested rect keeps
+    // the origin and rescales the size from the current DPI to `display`'s DPI.
+    let bounds = Bounds {
+        origin: bounds.to_device_pixels(display.scale_factor()).origin,
+        size: bounds.to_device_pixels(window_scale_factor).size,
+    };
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
 }
