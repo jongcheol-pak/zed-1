@@ -227,7 +227,10 @@ impl<'a, T: 'static> Context<'a, T> {
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
     pub fn notify(&mut self) {
-        self.app.notify(self.entity_state.entity_id);
+        self.app.notify_typed(
+            self.entity_state.entity_id,
+            Some(std::any::type_name::<T>()),
+        );
     }
 
     /// Spawn the future returned by the given function.

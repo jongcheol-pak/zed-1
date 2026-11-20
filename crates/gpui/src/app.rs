@@ -2472,6 +2472,10 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        self.notify_typed(entity_id, None);
+    }
+
+    pub(crate) fn notify_typed(&mut self, entity_id: EntityId, type_name: Option<&'static str>) {
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)
@@ -2499,7 +2503,7 @@ impl App {
             }
         } else {
             for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
+                invalidator.invalidate_view(entity_id, type_name, self);
             }
         }
 
@@ -2866,7 +2870,7 @@ impl<'a, T: 'static> std::ops::DerefMut for GpuiBorrow<'a, T> {
 impl<'a, T> Drop for GpuiBorrow<'a, T> {
     fn drop(&mut self) {
         let lease = self.inner.take().unwrap();
-        self.app.notify(lease.id);
+        self.app.notify_typed(lease.id, Some(type_name::<T>()));
         self.app.entities.end_lease(lease);
         self.app.finish_update();
     }

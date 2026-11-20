@@ -150,8 +150,14 @@ impl WindowInvalidator {
         }
     }
 
-    pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
+    pub fn invalidate_view(
+        &self,
+        entity: EntityId,
+        type_name: Option<&'static str>,
+        cx: &mut App,
+    ) -> bool {
         profiler::record_view_invalidated(entity);
+        profiler::record_dirty_view_type(type_name.unwrap_or("<untyped>"));
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);

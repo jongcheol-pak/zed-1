@@ -745,6 +745,24 @@ static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// tracing is off. One entry per window, so it stays small without a cap.
 static SLOWEST_DRAWS: spin::Mutex<Vec<(WindowId, Duration)>> = spin::Mutex::new(Vec::new());
 
+static DIRTY_VIEW_TYPES: spin::Mutex<Vec<(&'static str, u64)>> = spin::Mutex::new(Vec::new());
+
+pub(crate) fn record_dirty_view_type(type_name: &'static str) {
+    let mut counts = DIRTY_VIEW_TYPES.lock();
+    match counts.iter_mut().find(|(name, _)| *name == type_name) {
+        Some((_, count)) => *count += 1,
+        None => counts.push((type_name, 1)),
+    }
+}
+
+/// Drains the view invalidations per view type name recorded since the previous call,
+/// most invalidated first. Counted even when frame tracing is off.
+pub fn take_dirty_view_types() -> Vec<(&'static str, u64)> {
+    let mut counts = std::mem::take(&mut *DIRTY_VIEW_TYPES.lock());
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    counts
+}
+
 /// Records how long a window draw took, keeping only the slowest per window.
 pub(crate) fn record_draw_duration(window_id: WindowId, duration: Duration) {
     let mut slowest = SLOWEST_DRAWS.lock();
@@ -1011,6 +1029,27 @@ mod slowest_draw_tests {
         let ours: Vec<_> = taken.iter().filter(|(id, _)| *id == window).collect();
         assert_eq!(ours, vec![&(window, Duration::from_millis(120))]);
         assert!(take_slowest_draws().iter().all(|(id, _)| *id != window));
+    }
+
+    #[test]
+    fn dirty_view_types_are_counted_without_frame_trace() {
+        assert!(!frame_trace_enabled());
+        let busy = "slowest_draw_tests::Busy";
+        let quiet = "slowest_draw_tests::Quiet";
+        for _ in 0..3 {
+            record_dirty_view_type(busy);
+        }
+        record_dirty_view_type(quiet);
+        let ours: Vec<_> = take_dirty_view_types()
+            .into_iter()
+            .filter(|(name, _)| *name == busy || *name == quiet)
+            .collect();
+        assert_eq!(ours, vec![(busy, 3), (quiet, 1)]);
+        assert!(
+            take_dirty_view_types()
+                .iter()
+                .all(|(name, _)| *name != busy && *name != quiet)
+        );
     }
 }
 
